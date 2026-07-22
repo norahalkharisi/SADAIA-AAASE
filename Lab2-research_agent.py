@@ -14,21 +14,25 @@
 # ============================================================
 # STEP 0 — IMPORTS
 # ============================================================
-
+import os
 import operator
 from datetime import datetime
 from typing import Annotated, List, Dict
 from typing_extensions import TypedDict
-
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
-
-from langchain_ollama import ChatOllama
-from langchain_tavily import TavilySearch
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_openai import ChatOpenAI
+from langchain_tavily import TavilySearch, TavilyExtract
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from html import escape
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from langchain_chroma import Chroma
+from langchain_core.vectorstores import InMemoryVectorStore
 
 load_dotenv()
 
@@ -55,21 +59,47 @@ class AgentState(TypedDict):
     execution_logs: Annotated[List[str], operator.add]
 
 
+
 # ============================================================
-# STEP 2 — MODEL, SEARCH TOOL, EMBEDDINGS
+# STEP 2 — MODEL, SEARCH/FETCH TOOLS, EMBEDDINGS
 # ============================================================
 
-llm = ChatOllama(model="llama3.1", temperature=0)
-search_tool = TavilySearch(max_results=5)
+llm = ChatOpenAI(
+    model=os.getenv("MODEL_NAME", "google/gemma-4-26b-a4b-it:free"),
+    temperature=0,
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+)
+
+search_tool = TavilySearch(max_results=5)      
+extract_tool = TavilyExtract()                 
+
+research_tools = [search_tool, extract_tool]
+llm_with_tools = llm.bind_tools(research_tools)
+TOOLS_BY_NAME = {tool.name: tool for tool in research_tools}
+
+COLLECT_SYSTEM_PROMPT = (
+    "You are a research assistant gathering sources on a topic. You have "
+    "two tools:\n"
+    f"- {search_tool.name}: run a web search for a query and get back a "
+    "list of matching pages with short content snippets. Use this to "
+    "DISCOVER sources on the topic.\n"
+    f"- {extract_tool.name}: fetch the full content of one or more "
+    "specific URLs you already know about — from a prior search result, "
+    "or one the user gave you directly. Use this when a snippet isn't "
+    "enough and you need the full page text.\n\n"
+    "Call one or more tools to gather strong sources for the given "
+    "research query. Prefer searching first to discover sources, then "
+    "extracting the most promising URLs if you need deeper content. "
+    "Always call at least one tool — do not answer from memory."
+)
+
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-# Chroma = persistent vector memory across runs. If chromadb isn't
-# installed, fall back to the in-memory store (same API, no persistence).
+# Chroma = persistent vector memory across runs.
 try:
-    from langchain_chroma import Chroma
-
     vector_store = Chroma(
         collection_name="enterprise_research_memory",
         embedding_function=embedding_model,
@@ -77,24 +107,17 @@ try:
     )
     print("[setup] Using Chroma (persistent vector memory).")
 except ImportError:
-    from langchain_core.vectorstores import InMemoryVectorStore
-
     vector_store = InMemoryVectorStore(embedding=embedding_model)
-    print("[setup] chromadb not installed — using in-memory vector "
-          "store (no persistence). `pip install langchain-chroma` "
-          "to enable persistent memory.")
+    print("[setup] chromadb not installed — using in-memory vector store.")
 
 
 # ============================================================
 # STEP 3 — STRUCTURED OUTPUT for the quality score
 # ============================================================
-# The model is FORCED to return a valid integer — no more
-# int(response.content) parsing of free text.
 
 class QualityScore(BaseModel):
     """Evaluation of research quality."""
-    score: int = Field(ge=1, le=10,
-                       description="Overall research quality, 1-10")
+    score: int = Field(ge=1, le=10, description="Overall research quality, 1-10")
     reasoning: str = Field(description="One-sentence justification")
 
 
@@ -116,6 +139,21 @@ def log(message: str) -> List[str]:
     return [line]
 
 
+def _normalize_tool_output(output: Dict) -> List[Dict]:
+    """Flatten a Tavily tool's raw output into the {"url", "content"}
+    shape the rest of the graph (analyze_node, etc.) already expects.
+    search_tool results carry "content"; extract_tool results carry
+    "raw_content" instead — this reconciles the two."""
+    items = output.get("results", []) if isinstance(output, dict) else []
+    return [
+        {
+            "url": item.get("url", "unknown"),
+            "content": item.get("content") or item.get("raw_content", ""),
+        }
+        for item in items
+    ]
+
+
 # ============================================================
 # STEP 4 — NODES
 # ============================================================
@@ -123,7 +161,10 @@ def log(message: str) -> List[str]:
 # it changed). LangGraph merges it in — never mutate state in place.
 
 def collect_node(state: AgentState):
-    """Search the web. On retries, CHANGE the query to fetch different sources."""
+    """Ask the LLM to gather sources — it decides whether to run a
+    keyword search, fetch a specific URL's full content, or both,
+    via the tools bound in Step 2. On retries, CHANGE the query so
+    the model has a real chance to turn up different sources."""
     iteration = state["iteration_count"] + 1
 
     # LOOP GUARD, part 1: each retry uses a meaningfully different
@@ -138,16 +179,36 @@ def collect_node(state: AgentState):
     # instead of raising an IndexError.
     query = refinements[min(iteration - 1, len(refinements) - 1)]
 
-    results = search_tool.invoke({"query": query})["results"]
+    ai_message = llm_with_tools.invoke([
+        SystemMessage(COLLECT_SYSTEM_PROMPT),
+        HumanMessage(f"Research query: {query}"),
+    ])
+
+    results: List[Dict] = []
+    for call in ai_message.tool_calls:
+        tool = TOOLS_BY_NAME.get(call["name"])
+        if tool is None:
+            continue
+        results.extend(_normalize_tool_output(tool.invoke(call["args"])))
+
+    called = ", ".join(c["name"] for c in ai_message.tool_calls) or "none"
+    logs = log(
+        f"Iteration {iteration}: LLM called [{called}] and collected "
+        f"{len(results)} sources for query: '{query}'"
+    )
+
+    if not results:
+        # Local models can occasionally skip tool calls or return
+        # empty results — fall back to a direct search so the
+        # pipeline never stalls with zero sources.
+        logs += log("No sources from tool calls — falling back to a direct search.")
+        results = _normalize_tool_output(search_tool.invoke({"query": query}))
 
     return {
         "search_query": query,
         "collected_data": results,
         "iteration_count": iteration,
-        "execution_logs": log(
-            f"Iteration {iteration}: collected {len(results)} "
-            f"sources for query: '{query}'"
-        ),
+        "execution_logs": logs,
     }
 
 
@@ -346,11 +407,15 @@ if __name__ == "__main__":
     for chunk in app.stream(initial_state, config, stream_mode="values"):
         final_state = chunk
 
-    print("\n================================================")
-    print("FINAL RESEARCH REPORT")
-    print("================================================")
-    print(final_state["final_report"])
-
+    doc = SimpleDocTemplate("final_report.pdf", pagesize=A4)
+    styles = getSampleStyleSheet()
+    story = []
+    for para in final_state["final_report"].split("\n"):
+        if para.strip():
+            story.append(Paragraph(escape(para.strip()), styles["Normal"]))
+            story.append(Spacer(1, 6))
+    doc.build(story)
+    print("Saved: final_report.pdf")
     print("\n================================================")
     print("EXECUTION LOGS")
     print("================================================")
