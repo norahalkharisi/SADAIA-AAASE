@@ -3,4 +3,4 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-CMD ["python", "lab3_prototype_to_enterprise_.py"]
+CMD ["python", "lab3.py"]
